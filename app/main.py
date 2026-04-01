@@ -1,9 +1,10 @@
 from __future__ import annotations
+
 from dotenv import load_dotenv
 from pathlib import Path
 
 import streamlit as st
-from rag_utils import generate_answer, detect_region, classify_intent
+from rag_utils import generate_answer
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
@@ -33,13 +34,7 @@ question = st.text_input(
 
 if st.button("질문하기") and question:
     with st.spinner("문서 검색 및 답변 생성 중..."):
-        detected_region = detect_region(question)
-        detected_intent = classify_intent(question)
         answer, docs = generate_answer(question)
-
-    st.subheader("질문 분석")
-    st.write(f"- 감지된 지역: `{detected_region or '없음 (global 기준)'}`")
-    st.write(f"- 감지된 의도: `{detected_intent}`")
 
     st.subheader("답변")
     st.write(answer)

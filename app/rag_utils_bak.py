@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
-from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -16,19 +14,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PERSIST_DIR = str(BASE_DIR / "vectordb")
 COLLECTION_NAME = "allianz_care"
 
-ENV_PATH = BASE_DIR / ".env"
-load_dotenv(dotenv_path=ENV_PATH)
-
-# ingest.py와 동일한 임베딩 설정
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")
-EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
-
-
 # 1. 벡터스토어 연결
 def get_vectorstore() -> Chroma:
     embeddings = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL_NAME,
-        model_kwargs={"device": EMBED_DEVICE},
+        model_name="BAAI/bge-m3",
+        model_kwargs={"device": "cpu"},   # GPU 있으면 "cuda"
         encode_kwargs={"normalize_embeddings": True},
     )
 
@@ -38,8 +28,8 @@ def get_vectorstore() -> Chroma:
         collection_name=COLLECTION_NAME,
     )
 
-
-# 2. 입력 언어 감지
+# 2. 입력 언어 감지 (간단 rule-based)
+#    - 최종 언어 결정은 normalize_question() 결과를 우선 사용
 def detect_language(text: str) -> str:
     if any('\u4e00' <= c <= '\u9fff' for c in text):
         return "zh"
@@ -49,8 +39,10 @@ def detect_language(text: str) -> str:
         return "ko"
     return "en"
 
-
 # 3. 질문 표준화
+# - language / intent / region / english_query를 생성
+# - 다국어 입력을 내부 공통 표현으로 맞춤
+# - llm이 사용자의 질문을 바탕으로 rag 내에서 검색할 질의를 생성하기 위한 함수
 def normalize_question(question: str) -> Dict[str, Any]:
     llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
@@ -87,21 +79,26 @@ User question:
     fallback_language = detect_language(question)
 
     try:
+        # llm 응답 받기
         raw = llm.invoke(prompt).content.strip()
         data = json.loads(raw)
 
+        # llm 응답에 대한 처리
         language = data.get("language", fallback_language)
         intent = data.get("intent", "coverage")
         region = data.get("region", "none")
         english_query = data.get("english_query", question)
         keywords = data.get("keywords", [])
 
+        # 이 조건에 들어갈 일이 있나?
+        # 혹시 LLM이 enum 값을 잘못 반환하는 경우를 대비
         if language not in {"ko", "en", "zh", "ja", "es", "fr", "de", "other"}:
             language = fallback_language
 
         if intent not in {"coverage", "preauth", "claim"}:
             intent = "coverage"
 
+        # 허용된 지역 + 글로벌 외에는 모두 none으로 처리
         allowed_regions = {
             "singapore",
             "dubai_northern_emirates",
@@ -131,11 +128,12 @@ User question:
             "keywords": [str(k).strip() for k in keywords if str(k).strip()],
         }
 
+    # LLM이 JSON을 제대로 반환하지 못하는 경우, fallback으로 간단히 규칙 기반으로 감지
     except Exception:
         return fallback_normalize_question(question, fallback_language)
 
-
 # 3-1. 질문 표준화 fallback
+# - LLM 실패 시 사용되는 대체 함수
 def fallback_normalize_question(question: str, language: str) -> Dict[str, Any]:
     q = question.lower()
 
@@ -155,7 +153,9 @@ def fallback_normalize_question(question: str, language: str) -> Dict[str, Any]:
     else:
         intent = "coverage"
 
+    # 지역 감지
     region = detect_region_fallback(question)
+    # 영어 fallback 질의 생성
     english_query = build_fallback_english_query(question, intent, region)
 
     return {
@@ -166,20 +166,9 @@ def fallback_normalize_question(question: str, language: str) -> Dict[str, Any]:
         "keywords": [],
     }
 
-
-# 외부 호환용 래퍼
-def detect_region(question: str) -> Optional[str]:
-    normalized = fallback_normalize_question(question, detect_language(question))
-    region = normalized["region"]
-    return None if region == "none" else region
-
-
-def classify_intent(question: str) -> str:
-    normalized = fallback_normalize_question(question, detect_language(question))
-    return normalized["intent"]
-
-
 # 4. 지역 fallback 감지
+# - LLM 실패 시 최소한의 보조용
+# - 다국어 alias를 조금 더 넓게 반영
 def detect_region_fallback(question: str) -> Optional[str]:
     q = question.lower()
 
@@ -204,7 +193,7 @@ def detect_region_fallback(question: str) -> Optional[str]:
             r"홍콩", r"hong kong", r"\bhk\b", r"香港"
         ],
         "china": [
-            r"중국", r"\bchina\b", r"中?国", r"中国", r"中國", r"중화권", r"中国大陆"
+            r"중국", r"\bchina\b", r"中?国", r"中国", r"中國", r"中화권", r"中国大陆"
         ],
         "switzerland": [
             r"스위스", r"\bswitzerland\b", r"\bsuisse\b", r"瑞士", r"スイス"
@@ -232,34 +221,42 @@ def detect_region_fallback(question: str) -> Optional[str]:
 
     return None
 
-
 # 5. 검색 대상 doc_type 결정
 def get_allowed_doc_types(intent: str) -> List[str]:
-    if intent == "coverage":
-        return ["benefit_guide", "tob"]
-    if intent == "preauth":
+    if intent == "coverage":    # 보험 적용 범위인 경우
+        return ["benefit_guide", "tob"] # 보험 약관과 혜택 가이드가 모두 관련 정보 포함할 수 있도록 허용
+    if intent == "preauth":     # 사전 신청
         return ["benefit_guide", "preauth_form", "tob"]
-    if intent == "claim":
+    if intent == "claim":       # 청구
         return ["benefit_guide", "claim_form"]
     return ["benefit_guide", "tob"]
 
-
 # 6. 검색 질의 생성
+#    - 원문 질문 : 사용자 입력
+#    - 표준 영어 질의 : LLM이 생성한 영어 검색 질의
+#    - keyword 질의 : 
+#   - fallback 질의
 def make_search_queries(normalized: Dict[str, Any], original_question: str) -> List[str]:
     region = normalized["region"]
     intent = normalized["intent"]
     english_query = normalized["english_query"]
     keywords = normalized.get("keywords", [])
 
+    # 원문 질문과 LLM이 생성한 영어 질의
     queries = [original_question.strip(), english_query.strip()]
-
+    
+    # keyword 기반 질의
+    # 정상적으로 llm이 생성해준 경우와 그렇지 않은 경우 모두 대비
     keyword_query = build_keyword_query(intent, region, keywords)
     if keyword_query:
         queries.append(keyword_query)
-
+    
+    # LLM이 영어 질의나 키워드 질의를 제대로 생성하지 못하는 경우를 대비해, fallback으로 간단한 규칙 기반 질의 추가
     fallback_queries = build_fallback_queries(intent, region)
     queries.extend(fallback_queries)
 
+    # deduped : 중복 제거 + 공백 제거
+    # LLM이 의도한 검색 질의를 제대로 생성하지 못하는 경우를 대비해, 원문 질문과 간단한 규칙 기반 질의를 모두 포함하되, 중복은 제거
     deduped = []
     seen = set()
     for q in queries:
@@ -270,21 +267,26 @@ def make_search_queries(normalized: Dict[str, Any], original_question: str) -> L
 
     return deduped[:5]
 
-
+# 6-1. keyword 질의 생성
 def build_keyword_query(intent: str, region: str, keywords: List[str]) -> str:
     region_text = "" if region in {"none", "global"} else region.replace("_", " ")
     base = " ".join(keywords[:5]).strip()
 
+    # base가 있는 경우 : region + keywords 조합
+    # 정상적으로 LLM이 keywords를 생성한 경우, 이를 활용해 검색 질의를 만들어줌
     if base:
         return f"{region_text} {base}".strip()
 
+    # base가 없는 경우 : intent와 region 기반의 간단한 템플릿으로 생성
     if intent == "preauth":
         return f"{region_text} pre-authorisation inpatient hospitalisation approval".strip()
     if intent == "claim":
         return f"{region_text} claim reimbursement invoice receipt documents".strip()
+    # intent == "coverage"인 경우
     return f"{region_text} coverage benefits limits exclusions".strip()
 
-
+# 6-2. fallback 질의 생성
+# - LLM이 영어 질의를 제대로 생성하지 못하는 경우 대비
 def build_fallback_queries(intent: str, region: str) -> List[str]:
     region_text = "" if region in {"none", "global"} else region.replace("_", " ")
 
@@ -303,7 +305,10 @@ def build_fallback_queries(intent: str, region: str) -> List[str]:
         f"{region_text} inpatient outpatient benefit limit".strip(),
     ]
 
-
+# 6-1. fallback 영어 질의 생성
+# - LLM이 영어 질의를 제대로 생성하지 못하는 경우 대비
+# - 간단한 규칙 기반으로 영어 검색 질의 생성
+#   - 지역과 의도에 따라 기본적인 검색 질의 템플릿을 만들어줌
 def build_fallback_english_query(question: str, intent: str, region: Optional[str]) -> str:
     region_text = "" if not region or region == "none" else region.replace("_", " ")
 
@@ -312,7 +317,6 @@ def build_fallback_english_query(question: str, intent: str, region: Optional[st
     if intent == "claim":
         return f"What documents are required to submit a claim {f'in {region_text}' if region_text else ''}?".strip()
     return f"What is covered under the insurance plan {f'in {region_text}' if region_text else ''}?".strip()
-
 
 # 7. 문서 고유키
 def doc_unique_key(doc: Document) -> tuple:
@@ -324,8 +328,8 @@ def doc_unique_key(doc: Document) -> tuple:
         doc.metadata.get("region"),
     )
 
-
 # 8. 간단 rerank
+#    - 영어 기준 키워드로 점수화
 def score_document(question: str, doc: Document, intent: str, detected_region: Optional[str]) -> int:
     score = 0
     q = question.lower()
@@ -363,21 +367,26 @@ def score_document(question: str, doc: Document, intent: str, detected_region: O
     score += min(len(content) // 300, 3)
     return score
 
-
 # 9. 문서 검색
 def retrieve_documents(question: str):
     vectordb = get_vectorstore()
 
+    # 문서에 넣을 검색 질의 생성
     normalized = normalize_question(question)
-
+    
+    # intent : coverage / preauth / claim
     intent = normalized["intent"]
+    # 지역
     detected_region = None if normalized["region"] == "none" else normalized["region"]
+    # 검색 대상 doc_type 결정
     allowed_doc_types = get_allowed_doc_types(intent)
 
+    # rag 문서 검색 : global 문서 + 감지된 지역 문서 동시에 검색하게
     regions = ["global"]
     if detected_region and detected_region != "global":
         regions.append(detected_region)
-
+    
+    # 검색 질의 생성 - 원문 질문 + 영어 변환 질문 + keyword 기반 질문 + fallback 질문
     queries = make_search_queries(normalized, question)
 
     all_docs: List[Document] = []
@@ -419,14 +428,13 @@ def retrieve_documents(question: str):
 
     return ranked_docs[:10], normalized, regions, queries
 
-
 # 10. 문서 컨텍스트 생성
 def strip_search_tags(text: str) -> str:
     if "[search_tags]" in text:
         return text.split("[search_tags]")[0].strip()
     return text.strip()
 
-
+# 문서 컨텍스트 생성 - 검색된 문서들을 LLM이 이해하기 좋은 형태로 가공
 def build_context(docs: List[Document]) -> str:
     context_parts = []
 
@@ -445,7 +453,6 @@ def build_context(docs: List[Document]) -> str:
 
     return "\n\n".join(context_parts)
 
-
 # 11. 답변 언어 맵
 LANGUAGE_NAME_MAP = {
     "ko": "Korean",
@@ -457,7 +464,6 @@ LANGUAGE_NAME_MAP = {
     "de": "German",
     "other": "the same language as the user's question",
 }
-
 
 # 12. 답변 생성
 def generate_answer(question: str) -> Tuple[str, list]:
@@ -522,7 +528,7 @@ Context:
     result = llm.invoke(prompt)
     return result.content, docs
 
-
+# 13. 디버깅용 단독 실행
 if __name__ == "__main__":
     sample_questions = [
         "싱가포르에서 입원 치료 전에 사전승인이 필요한가요?",
