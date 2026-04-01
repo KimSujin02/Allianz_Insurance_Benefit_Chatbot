@@ -1,0 +1,25 @@
+# Core
+python-dotenv
+streamlit
+
+# LangChain ecosystem
+langchain
+langchain-community
+langchain-core
+langchain-openai
+langchain-huggingface
+
+# Vector DB
+chromadb
+
+# Embedding / ML
+sentence-transformers
+torch
+
+# PDF processing
+pymupdf
+pdfplumber
+
+# Utils
+tqdm
+numpy
