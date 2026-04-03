@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import shutil
 from math import ceil
 from pathlib import Path
 from typing import List, Dict, Any
 
 import fitz  # PyMuPDF
-import pdfplumber
 import torch
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -18,17 +18,17 @@ from langchain_huggingface import HuggingFaceEmbeddings
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 DATA_DIR = BASE_DIR / "data" / "raw"
+CHUNKED_DIR = BASE_DIR / "data" / "chunked"
 DB_DIR = BASE_DIR / "vectordb"
 COLLECTION_NAME = "allianz_care"
 
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-# =========================
 # 실행 옵션
-# =========================
+# 다국어 임베딩 모델과 인덱싱 배치 사이즈는 환경변수로 조정 가능
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")
-EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")  # GPU 있으면 cuda
+EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
 INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "100"))
 RESET_VECTORDB = os.getenv("RESET_VECTORDB", "true").lower() == "true"
@@ -37,12 +37,12 @@ TORCH_NUM_THREADS = int(
     os.getenv("TORCH_NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1)))
 )
 
+# PyTorch의 스레드 수를 제한하여 인덱싱 시 CPU 과부하 방지
 torch.set_num_threads(TORCH_NUM_THREADS)
 try:
     torch.set_num_interop_threads(1)
 except RuntimeError:
     pass
-
 
 # 1. 파일 목록
 FILES: List[Dict[str, Any]] = [
@@ -60,6 +60,7 @@ FILES: List[Dict[str, Any]] = [
         "doc_year": 2025,
         "region": "global",
         "product_family": "care_global",
+        "chunked_path": CHUNKED_DIR / "care-tob-en_보장금액_table_chunks.jsonl",
     },
     {
         "path": DATA_DIR / "FRM-PreAuth-EN-0825_사전승인신청서.pdf",
@@ -296,174 +297,125 @@ def chunk_benefit_guide(
             )
     return docs
 
-
-def normalize_cell_text(text: str) -> str:
+def normalize_form_line(text: str) -> str:
     if not text:
         return ""
     text = text.replace("\xa0", " ")
     text = text.replace("\u200b", " ")
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r"\s*:\s*", ": ", text)
     return text.strip()
 
 
-def is_noise_line(line: str) -> bool:
-    line_l = line.lower().strip()
-    noise_patterns = [
-        r"^care base care enhanced care signature$",
-        r"^core plans key to table of benefits",
-        r"^√ covered in full",
-        r"^x not available$",
-        r"^maximum plan limit$",
-        r"^out-patient plans$",
-        r"^dental plans$",
-        r"^area of cover$",
-        r"^click here or press enter",
-        r"^looking for something specific\?$",
-    ]
-    return any(re.search(p, line_l) for p in noise_patterns)
-
-
-def is_section_header(line: str) -> bool:
-    line_l = line.lower().strip()
-    section_patterns = [
-        r"^in-patient benefits$",
-        r"^other benefits$",
-        r"^additional core plan services$",
-        r"^out-patient plan benefits$",
-        r"^dental plan benefits$",
-        r"^core plans\b",
-        r"^out-patient plans\b",
-        r"^dental plans\b",
-    ]
-    return any(re.search(p, line_l) for p in section_patterns)
-
-
-def looks_like_row_start(line: str) -> bool:
-    s = line.strip()
-    s_l = s.lower()
-
+def is_form_noise_line(line: str) -> bool:
+    s = line.strip().lower()
     if not s:
-        return False
+        return True
 
-    banned_fragments = [
-        "pre-authorisation required",
-        "waiting period applies",
-        "in-patient and out-patient treatment",
-        "in-patient treatment only",
-        "in-patient and day-care treatment only",
-        "out-patient treatment only",
-        "day-care treatment",
-        "per pregnancy",
-        "per event",
-        "max.",
-        "private room",
-        "up to",
-        "√",
-        "x",
-        "£",
-        "€",
-        "us$",
-        "chf",
+    noise_patterns = [
+        r"^dd\s*/\s*mm\s*/\s*yyyy$",
+        r"^d d\s*/\s*m m\s*/\s*y y y y$",
+        r"^country code$",
+        r"^area code$",
+        r"^country\s+code$",
+        r"^area\s+code$",
+        r"^yes no$",
+        r"^yes\s+no$",
+        r"^mr\.?\s+mrs\.?\s+ms\.?\s+miss\.?\s+other$",
+        r"^official stamp of medical provider$",
     ]
-    if any(x in s_l for x in banned_fragments):
-        return False
-
-    if len(s) > 120:
-        return False
-
-    return bool(re.match(r"^[A-Z][A-Za-z0-9/\-\(\),&’' ]+$", s))
+    return any(re.search(p, s) for p in noise_patterns)
 
 
-def build_tob_row_documents_from_page_text(
-    text: str,
-    page_num: int,
-    source_name: str,
-    file_info: Dict[str, Any],
-) -> List[Document]:
-    docs: List[Document] = []
-    lines = [normalize_cell_text(line) for line in text.split("\n") if normalize_cell_text(line)]
+def is_form_section_header(line: str) -> bool:
+    s = line.strip().lower()
 
-    current_section = None
-    current_row: List[str] = []
-    chunk_idx = 0
+    section_patterns = [
+        r"^\d+\s+patient[’']?s details",
+        r"^\d+\s+medical details",
+        r"^\d+\s+treatment details",
+        r"^\d+\s+patient details",
+        r"^\d+\s+your personal data",
+        r"^\d+\s+declaration",
+        r"^patient[’']?s details$",
+        r"^medical details$",
+        r"^treatment details$",
+        r"^your personal data$",
+        r"^declaration$",
+        r"^medical provider details$",
+        r"^treatment$",
+        r"^costs$",
+        r"^applicable to cases of pregnancy only:?$",
+        r"^please also provide the following details for maternity cases$",
+    ]
+    return any(re.search(p, s) for p in section_patterns)
 
-    def flush_row():
-        nonlocal chunk_idx, current_row
 
-        if not current_row:
-            return
+def clean_form_field(line: str) -> str:
+    s = normalize_form_line(line)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" -•\t")
 
-        row_text = " | ".join(current_row).strip()
-        if len(row_text) < 20:
-            current_row = []
-            return
 
-        structured_text = row_text
-        if current_section:
-            structured_text = f"Section: {current_section}\n{row_text}"
+def summarize_form_section(section: str, fields: List[str], source_name: str) -> str:
+    field_text = ", ".join(fields)
 
-        docs.append(
-            Document(
-                page_content=enrich_text_for_multilingual_search(structured_text, file_info),
-                metadata=build_common_metadata(
-                    file_info=file_info,
-                    source_name=source_name,
-                    page_num=page_num,
-                    chunk_idx=chunk_idx,
-                    section=current_section,
-                ),
-            )
+    section_l = section.lower()
+
+    if "patient" in section_l and "detail" in section_l:
+        summary = (
+            "This section describes the patient information required in the form, "
+            "including identity, policy, birth date, and contact details."
         )
-        chunk_idx += 1
-        current_row = []
+    elif "medical" in section_l and "detail" in section_l:
+        summary = (
+            "This section describes the medical information required in the form, "
+            "including symptoms, diagnosis, condition history, ICD/DSM code, recurrence, "
+            "rehabilitation, permanence, monitoring needs, and related treatment details."
+        )
+    elif "treatment" in section_l:
+        summary = (
+            "This section describes treatment information required for review, "
+            "including planned procedure, admission date, diagnosis-related codes, "
+            "length of stay, and estimated treatment costs."
+        )
+    elif "medical provider details" in section_l:
+        summary = (
+            "This section describes the medical provider information required, "
+            "including hospital or facility details, doctor details, and contact information."
+        )
+    elif "cost" in section_l:
+        summary = (
+            "This section describes cost-related information required in the form, "
+            "including package price, hospital charges, doctor or anaesthetist fees, "
+            "and total estimated costs."
+        )
+    elif "declaration" in section_l:
+        summary = (
+            "This section describes the declaration and signature requirements, "
+            "including confirmation of accuracy, consent, and signing responsibilities."
+        )
+    elif "personal data" in section_l:
+        summary = (
+            "This section describes personal data and consent requirements, "
+            "including privacy notice, consent for medical data processing, and related obligations."
+        )
+    elif "pregnancy" in section_l or "maternity" in section_l:
+        summary = (
+            "This section describes pregnancy or maternity-related information required, "
+            "including delivery date, single or multiple birth status, and assisted reproduction details."
+        )
+    else:
+        summary = (
+            "This section describes information required in the form and the fields that must be completed."
+        )
 
-    for line in lines:
-        if is_noise_line(line):
-            continue
-
-        if is_section_header(line):
-            flush_row()
-            current_section = line
-            continue
-
-        if looks_like_row_start(line):
-            flush_row()
-            current_row = [line]
-            continue
-
-        if current_row:
-            current_row.append(line)
-
-    flush_row()
-    return docs
-
-
-def chunk_tob_pdfplumber(
-    pdf_path: Path,
-    source_name: str,
-    file_info: Dict[str, Any],
-) -> List[Document]:
-    docs: List[Document] = []
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_idx, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            text = normalize_cell_text(text)
-            if not text:
-                continue
-
-            docs.extend(
-                build_tob_row_documents_from_page_text(
-                    text=text,
-                    page_num=page_idx,
-                    source_name=source_name,
-                    file_info=file_info,
-                )
-            )
-
-    return docs
-
+    return "\n".join([
+        f"Form document: {source_name}",
+        f"Section: {section}",
+        summary,
+        f"Fields included: {field_text}",
+    ])
 
 def chunk_form(
     pages: List[tuple[int, str]],
@@ -472,21 +424,140 @@ def chunk_form(
 ) -> List[Document]:
     docs: List[Document] = []
 
-    for page_num, text in pages:
-        blocks = [b.strip() for b in text.split("\n\n") if len(b.strip()) > 40]
+    current_section = "General"
+    current_fields: List[str] = []
+    current_page = 1
+    chunk_idx = 0
 
-        for idx, block in enumerate(blocks):
-            docs.append(
-                Document(
-                    page_content=enrich_text_for_multilingual_search(block, file_info),
-                    metadata=build_common_metadata(
-                        file_info=file_info,
-                        source_name=source_name,
-                        page_num=page_num,
-                        chunk_idx=idx,
-                    ),
-                )
+    def flush_section():
+        nonlocal current_fields, chunk_idx, current_section, current_page
+
+        unique_fields: List[str] = []
+        seen = set()
+
+        for field in current_fields:
+            field_norm = field.strip().lower()
+            if not field_norm:
+                continue
+            if field_norm in seen:
+                continue
+            seen.add(field_norm)
+            unique_fields.append(field)
+
+        if not unique_fields:
+            current_fields = []
+            return
+
+        content = summarize_form_section(
+            section=current_section,
+            fields=unique_fields,
+            source_name=source_name,
+        )
+        content += "\nForm purpose: insurance claim or pre-authorisation document."
+
+        docs.append(
+            Document(
+                page_content=enrich_text_for_multilingual_search(content, file_info),
+                metadata=build_common_metadata(
+                    file_info=file_info,
+                    source_name=source_name,
+                    page_num=current_page,
+                    chunk_idx=chunk_idx,
+                    section=current_section,
+                ),
             )
+        )
+
+        chunk_idx += 1
+        current_fields = []
+
+    for page_num, text in pages:
+        lines = [normalize_form_line(line) for line in text.split("\n")]
+        lines = [line for line in lines if line and not is_form_noise_line(line)]
+
+        for line in lines:
+            if is_form_section_header(line):
+                flush_section()
+                current_section = clean_form_field(line)
+                current_page = page_num
+                continue
+
+            cleaned = clean_form_field(line)
+
+            if len(cleaned) < 2:
+                continue
+
+            # 너무 긴 문장은 안내문/설명문일 가능성이 높으므로 섹션 설명으로는 유지하되 필드로는 제한적으로만 반영
+            if len(cleaned) > 180:
+                continue
+
+            current_fields.append(cleaned)
+
+    flush_section()
+    return docs
+
+
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        print(f"[WARN] JSONL 파일이 없습니다: {path}")
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"[WARN] JSONL 파싱 실패: {path} line={line_no} | {e}")
+
+    return rows
+
+# TOB JSONL에서 추출 -> DOCUMENT 리스트로 변환
+def chunk_tob_jsonl(
+    jsonl_path: Path,
+    source_name: str,
+    file_info: Dict[str, Any],
+) -> List[Document]:
+    docs: List[Document] = []
+    items = load_jsonl(jsonl_path)
+
+    for idx, item in enumerate(items):
+        text = clean_text(item.get("text", ""))
+        if not text:
+            continue
+
+        page_num = item.get("page_start") or item.get("page") or 0
+        source_file = item.get("source_file") or source_name
+
+        metadata = build_common_metadata(
+            file_info=file_info,
+            source_name=source_file,
+            page_num=page_num,
+            chunk_idx=idx,
+            section=item.get("section"),
+        )
+
+        metadata.update(
+            {
+                "chunk_id": item.get("chunk_id"),
+                "doc_id": item.get("doc_id"),
+                "page_start": item.get("page_start"),
+                "page_end": item.get("page_end"),
+                "subsection": item.get("subsection"),
+                "row_count": item.get("row_count"),
+                "benefit_names": item.get("benefit_names", []),
+            }
+        )
+
+        docs.append(
+            Document(
+                page_content=enrich_text_for_multilingual_search(text, file_info),
+                metadata=metadata,
+            )
+        )
 
     return docs
 
@@ -499,35 +570,44 @@ def build_documents() -> List[Document]:
         source_name = path.name
         doc_type = file_info["doc_type"]
 
-        if not path.exists():
-            print(f"[WARN] 파일이 없습니다: {path}")
-            continue
-
         print(
             f"[INFO] 처리 중: {source_name} | type={doc_type} | "
             f"region={file_info['region']} | year={file_info['doc_year']}"
         )
 
         if doc_type == "tob":
-            docs = chunk_tob_pdfplumber(path, source_name, file_info)
-        else:
-            pages = read_pdf_pages(path)
-            if not pages:
+            # TOB는 PDF에서 직접 텍스트를 추출하지 않고, 사전에 추출된 JSONL 파일을 사용
+            jsonl_path: Path | None = file_info.get("chunked_path")
+
+            if not jsonl_path:
+                print(f"[WARN] TOB chunked_path가 없습니다: {source_name}")
                 continue
 
-            if doc_type == "benefit_guide":
-                docs = chunk_benefit_guide(pages, source_name, file_info)
-            elif doc_type in ["preauth_form", "claim_form"]:
-                docs = chunk_form(pages, source_name, file_info)
-            else:
-                print(f"[WARN] 지원하지 않는 doc_type: {doc_type}")
-                continue
+            docs = chunk_tob_jsonl(jsonl_path, source_name, file_info)
+            all_docs.extend(docs)
+            continue
+
+        if not path.exists():
+            print(f"[WARN] 파일이 없습니다: {path}")
+            continue
+
+        pages = read_pdf_pages(path)
+        if not pages:
+            continue
+
+        if doc_type == "benefit_guide":
+            docs = chunk_benefit_guide(pages, source_name, file_info)
+        elif doc_type in ["preauth_form", "claim_form"]:
+            docs = chunk_form(pages, source_name, file_info)
+        else:
+            print(f"[WARN] 지원하지 않는 doc_type: {doc_type}")
+            continue
 
         all_docs.extend(docs)
 
     return all_docs
 
-
+# 다국어 임베딩 모델 불러오기
 def build_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=EMBED_MODEL_NAME,
@@ -544,7 +624,7 @@ def reset_vectordb_if_needed() -> None:
         print(f"[INFO] 기존 벡터DB 삭제: {DB_DIR}")
         shutil.rmtree(DB_DIR, ignore_errors=True)
 
-
+# DOCUMENT 리스트를 벡터DB에 인덱싱
 def index_documents(documents: List[Document], batch_size: int = INDEX_BATCH_SIZE) -> None:
     if not documents:
         print("[WARN] 인덱싱할 문서가 없습니다.")
@@ -593,7 +673,7 @@ def index_documents(documents: List[Document], batch_size: int = INDEX_BATCH_SIZ
 
 def main() -> None:
     documents = build_documents()
-    print(f"[INFO] Final chunk count: {len(documents)}")
+    print(f"[INFO] 총 청크 수: {len(documents)}")
     index_documents(documents)
 
 
